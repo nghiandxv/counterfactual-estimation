@@ -1,7 +1,8 @@
-# Source: https://github.com/tadeephuy/GradientReversal
-import torch.nn as nn
+"""Source: https://github.com/tadeephuy/GradientReversal"""
+
 import torch
 import torch.autograd as autograd
+import torch.nn as nn
 
 
 class GradientReversalFunction(autograd.Function):

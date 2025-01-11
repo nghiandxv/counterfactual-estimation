@@ -1,14 +1,15 @@
 from abc import abstractmethod
 from copy import deepcopy
+from dataclasses import field
+from enum import IntEnum
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
-from enum import IntEnum
-
-from dataclasses import field
-from scipy.stats import truncnorm
 from scipy.special import expit as sigmoid
-from src.utils.misc import dataclass, new_rng, Seed, tqdm
+from scipy.stats import truncnorm
+
+from src.utils.misc import Seed, dataclass, lmap, new_rng, tqdm
 
 
 def calc_spherical_volume(diameter):
@@ -26,8 +27,15 @@ def calc_spherical_diameter(volume):
 DEATH_CONDITION_DIAMETER = 13.0
 DEATH_CONDITION_VOLUME = float(calc_spherical_volume(DEATH_CONDITION_DIAMETER))
 
+NUMERICAL_EPS = 1e-3
+
+
+def is_close(a, b):
+    return np.isclose(a, b, atol=NUMERICAL_EPS)
+
+
 TumorStages = IntEnum('TumorStages', ['I', 'II', 'IIIA', 'IIIB', 'IV'], start=0)
-PatientGroups = IntEnum('PatientGroups', ['I', 'II', 'III'], start=0)
+PatientTypes = IntEnum('PatientTypes', ['I', 'II', 'III'], start=0)
 PatientStatuses = IntEnum('PatientStatuses', ['TUMOR', 'RECOVERED', 'DEAD'], start=0)
 
 
@@ -110,9 +118,7 @@ class SimulationParams:
 
         idx = 0
         while idx <= size - 1:  # rejection sampling
-            alpha, rho = rng.multivariate_normal(
-                mean=self.alpha_rho_mean, cov=self.alpha_rho_cov
-            )
+            alpha, rho = rng.multivariate_normal(mean=self.alpha_rho_mean, cov=self.alpha_rho_cov)
             if alpha < self.alpha_dist.lower or alpha > self.alpha_dist.upper:
                 continue
             if rho < self.rho_dist.lower or rho > self.rho_dist.upper:
@@ -124,7 +130,7 @@ class SimulationParams:
 
 @dataclass
 class PatientParams:
-    group: PatientGroups
+    patient_type: PatientTypes
 
     initial_tumor_stage: TumorStages
     initial_tumor_volume: float
@@ -159,7 +165,7 @@ DEFAULT_SIMULATION_PARAMS = SimulationParams(
     beta_c_dist=ParamDist(mu=0.028, sigma=0.0007),
     alpha_beta_ratio=10,
     alpha_rho_corr=0.87,
-    k=calc_spherical_volume(30),
+    k=float(calc_spherical_volume(30)),
 )
 
 
@@ -170,12 +176,11 @@ def generate_patient_profiles(
     seed: Seed = 0,
 ):
     rng = new_rng(seed)
-    groups = rng.choice(list(PatientGroups), num_patients)
+    patient_types = rng.choice(list(PatientTypes), num_patients)
 
     total_tumor_rates = sum(dist.rate for dist in tumor_stage_to_dist.values())
     tumor_proportions = {
-        stage: dist.rate / total_tumor_rates
-        for stage, dist in tumor_stage_to_dist.items()
+        stage: dist.rate / total_tumor_rates for stage, dist in tumor_stage_to_dist.items()
     }
 
     initial_tumor_stages = rng.choice(
@@ -197,7 +202,7 @@ def generate_patient_profiles(
 
     return [
         PatientParams(
-            group=params[0],
+            patient_type=params[0],
             initial_tumor_stage=params[1],
             initial_tumor_volume=params[2],
             tumor_rho=params[3],
@@ -207,7 +212,7 @@ def generate_patient_profiles(
             chemo_beta_c=params[7],
         )
         for params in zip(
-            groups,
+            patient_types,
             initial_tumor_stages,
             initial_tumor_volumes,
             rhos,
@@ -223,14 +228,12 @@ def add_heterogeneous_effect(
     patient_params: PatientParams,
     simulation_params: SimulationParams = DEFAULT_SIMULATION_PARAMS,
 ):
-    match patient_params.group:
-        case PatientGroups.I:
+    match patient_params.patient_type:
+        case PatientTypes.I:
             alpha_adjustments = 0.1 * simulation_params.alpha_dist.mu
             patient_params.radio_alpha += alpha_adjustments
-            patient_params.radio_beta += (
-                alpha_adjustments * simulation_params.alpha_beta_ratio
-            )
-        case PatientGroups.III:
+            patient_params.radio_beta += alpha_adjustments * simulation_params.alpha_beta_ratio
+        case PatientTypes.III:
             beta_c_adjustments = 0.1 * simulation_params.beta_c_dist.mu
             patient_params.chemo_beta_c += beta_c_adjustments
     return patient_params
@@ -243,6 +246,8 @@ class TumorModel:
         volumes: list[float] = field(default_factory=list)
         chemo_concentrations: list[float] = field(default_factory=list)
         patient_statuses: list[PatientStatuses] = field(default_factory=list)
+
+    state: State = field(default_factory=State, init=False)
 
     tumor_rho: float
     tumor_k: float
@@ -259,8 +264,6 @@ class TumorModel:
     min_volume: float = field(default=0.0, init=False)
     max_volume: float = field(default=DEATH_CONDITION_VOLUME, init=False)
     tumor_cell_density: float = field(default=5.8 * 1e8, init=False)
-
-    state: State = field(default_factory=State, init=False)
 
     def __post_init__(self):
         self.rng = new_rng(self.seed)
@@ -291,9 +294,7 @@ class TumorModel:
         return (self.radio_alpha * dose + self.radio_beta * dose**2) * self.last_volume
 
     def grow(self):
-        return (
-            1 + self.tumor_rho * np.log(self.tumor_k / self.last_volume)
-        ) * self.last_volume
+        return (1 + self.tumor_rho * np.log(self.tumor_k / self.last_volume)) * self.last_volume
 
     def decay_residual_chemo(self):
         return np.exp(-np.log(2) / self.chemo_half_life) * self.last_chemo_concentration
@@ -312,9 +313,9 @@ class TumorModel:
                 volume += self.rng.normal(scale=self.noise_sigma)
                 volume = np.clip(volume, self.min_volume, self.max_volume)
 
-                if self.is_controlled(volume) or volume == self.min_volume:
+                if self.is_controlled(volume) or is_close(volume, self.min_volume):
                     patient_status = PatientStatuses.RECOVERED
-                elif volume == self.max_volume:
+                elif is_close(volume, self.max_volume):
                     patient_status = PatientStatuses.DEAD
                 else:
                     patient_status = PatientStatuses.TUMOR
@@ -357,8 +358,7 @@ class BaseTreatmentPlan:
     def chemo_dose(self):
         if not self.state.chemo_doses:
             raise ValueError(
-                'No chemo doses have been planned yet. '
-                'Please run the `step` method first.'
+                'No chemo doses have been planned yet. ' 'Please run the `step` method first.'
             )
         return self.state.chemo_doses[-1]
 
@@ -366,8 +366,7 @@ class BaseTreatmentPlan:
     def radio_dose(self):
         if not self.state.radio_doses:
             raise ValueError(
-                'No radio doses have been planned yet. '
-                'Please run the `step` method first.'
+                'No radio doses have been planned yet. ' 'Please run the `step` method first.'
             )
         return self.state.radio_doses[-1]
 
@@ -410,7 +409,7 @@ class DefaultTreatmentPlan(BaseTreatmentPlan):
 
     def calc_avg_tumor_diameter(self, tumor_model: TumorModel):
         tumow_volume_window = tumor_model.volumes[-self.window_size :]
-        return np.mean(list(map(calc_spherical_diameter, tumow_volume_window)))
+        return np.mean(lmap(calc_spherical_diameter, tumow_volume_window))
 
     def calc_treatment(
         self,
@@ -420,7 +419,7 @@ class DefaultTreatmentPlan(BaseTreatmentPlan):
         dose_per_usage: float,
     ):
         prob = sigmoid(gamma / DEATH_CONDITION_DIAMETER * (avg_tumor_diameter - theta))
-        usage = prob > self.rng.random()
+        usage = prob < self.rng.random()
         dose = usage * dose_per_usage
         return dose, prob
 
@@ -498,12 +497,8 @@ class PredefinedTreatmentPlan(BaseTreatmentPlan):
             chemo_dose_per_usage=chemo_dose_per_usage,
             radio_dose_per_usage=radio_dose_per_usage,
         )
-        plan.state.chemo_doses = [
-            chemo_dose * chemo_dose_per_usage for chemo_dose in chemo_usages
-        ]
-        plan.state.radio_doses = [
-            radio_dose * radio_dose_per_usage for radio_dose in radio_usages
-        ]
+        plan.state.chemo_doses = [usage * chemo_dose_per_usage for usage in chemo_usages]
+        plan.state.radio_doses = [usage * radio_dose_per_usage for usage in radio_usages]
         return plan
 
 
@@ -520,10 +515,10 @@ def run_simulation(
     seed: Any = 0,
 ) -> tuple[list[PatientParams], list[SimulationResult]]:
     patient_profiles = generate_patient_profiles(num_patients, seed=seed)
-    patient_profiles = list(map(add_heterogeneous_effect, patient_profiles))
+    patient_profiles = lmap(add_heterogeneous_effect, patient_profiles)
 
     results = []
-    for patient_params in tqdm(patient_profiles, desc='Simulating patients'):
+    for patient_params in tqdm(patient_profiles, desc='Simulating'):
         tumor_model = TumorModel(
             tumor_rho=patient_params.tumor_rho,
             tumor_k=patient_params.tumor_k,
@@ -549,9 +544,18 @@ def run_simulation(
     return patient_profiles, results
 
 
+# @dataclass
+# class SimulationResultWithCounterfactuals(SimulationResult):
+#     counterfactuals_over_time: list[list[SimulationResult]]
+
+
 @dataclass
 class SimulationResultWithCounterfactuals(SimulationResult):
-    counterfactuals_over_time: list[list[SimulationResult]]
+    @dataclass
+    class TimeStepResult:
+        counterfactuals: list[SimulationResult]
+
+    time_steps: list[TimeStepResult]
 
 
 def run_simulation_with_counterfactuals(
@@ -561,14 +565,14 @@ def run_simulation_with_counterfactuals(
     seed: Any = 0,
 ) -> tuple[list[PatientParams], list[SimulationResultWithCounterfactuals]]:
     patient_profiles = generate_patient_profiles(num_patients, seed=seed)
-    patient_profiles = list(map(add_heterogeneous_effect, patient_profiles))
+    patient_profiles = lmap(add_heterogeneous_effect, patient_profiles)
 
     results: tuple[TumorModel, BaseTreatmentPlan] = []
 
     chemo_dose_per_usage = treatment_plan.chemo_dose_per_usage
     radio_dose_per_usage = treatment_plan.radio_dose_per_usage
 
-    for patient_params in tqdm(patient_profiles, desc='Simulating patients'):
+    for patient_params in tqdm(patient_profiles, desc='Simulating with counterfactuals'):
         tumor_model = TumorModel(
             tumor_rho=patient_params.tumor_rho,
             tumor_k=patient_params.tumor_k,
@@ -579,7 +583,7 @@ def run_simulation_with_counterfactuals(
         )
         treatment_plan.reset()
 
-        counterfactuals_over_time = []
+        time_steps = []
 
         for _ in range(1, num_time_steps):
             reference_tumor_model = deepcopy(tumor_model)
@@ -590,10 +594,7 @@ def run_simulation_with_counterfactuals(
             factual_chemo_dose = treatment_plan.chemo_dose
             factual_radio_dose = treatment_plan.radio_dose
 
-            tumor_model.step(
-                chemo_dose=factual_chemo_dose,
-                radio_dose=factual_radio_dose,
-            )
+            tumor_model.step(chemo_dose=factual_chemo_dose, radio_dose=factual_radio_dose)
 
             counterfactuals = []
 
@@ -603,10 +604,7 @@ def run_simulation_with_counterfactuals(
                 (chemo_dose_per_usage, 0),
                 (chemo_dose_per_usage, radio_dose_per_usage),
             ]:
-                if (
-                    chemo_dose == factual_chemo_dose
-                    and radio_dose == factual_radio_dose
-                ):
+                if chemo_dose == factual_chemo_dose and radio_dose == factual_radio_dose:
                     continue
 
                 counterfactual_tumor_model = deepcopy(reference_tumor_model)
@@ -615,10 +613,8 @@ def run_simulation_with_counterfactuals(
                     radio_dose=radio_dose,
                 )
                 predefined_treatment_plan = PredefinedTreatmentPlan.generate_finished(
-                    chemo_usages=reference_treatment_plan.state.chemo_usages
-                    + [chemo_dose > 0],
-                    radio_usages=reference_treatment_plan.state.radio_usages
-                    + [radio_dose > 0],
+                    chemo_usages=reference_treatment_plan.state.chemo_usages + [chemo_dose > 0],
+                    radio_usages=reference_treatment_plan.state.radio_usages + [radio_dose > 0],
                     chemo_dose_per_usage=chemo_dose_per_usage,
                     radio_dose_per_usage=radio_dose_per_usage,
                 )
@@ -630,13 +626,13 @@ def run_simulation_with_counterfactuals(
                     )
                 )
 
-            counterfactuals_over_time.append(counterfactuals)
+            time_steps.append(SimulationResultWithCounterfactuals.TimeStepResult(counterfactuals))
 
         results.append(
             SimulationResultWithCounterfactuals(
                 tumor_model=deepcopy(tumor_model),
                 treatment_plan=deepcopy(treatment_plan),
-                counterfactuals_over_time=counterfactuals_over_time,
+                time_steps=time_steps,
             )
         )
 
@@ -644,9 +640,7 @@ def run_simulation_with_counterfactuals(
 
 
 def plot_results(results: list[SimulationResult]):
-    import matplotlib.pyplot as plt
-
-    _, ax = plt.subplots()
+    fig, ax = plt.subplots()
 
     for idx, result in enumerate(results):
         tumor_model, treatment_plan = result.tumor_model, result.treatment_plan
@@ -654,6 +648,7 @@ def plot_results(results: list[SimulationResult]):
         chemo_usages = np.asarray(treatment_plan.state.chemo_usages)
         radio_usages = np.asarray(treatment_plan.state.radio_usages)
 
+        tumor_volumes = np.clip(tumor_volumes, NUMERICAL_EPS, np.inf)
         ax.plot(tumor_volumes)
 
         arange = np.arange(len(chemo_usages))
@@ -664,18 +659,19 @@ def plot_results(results: list[SimulationResult]):
             tumor_volumes[:-1][chemo_usages],
             color='red',
             label=chemo_label,
-            marker='+',
+            marker=6,
         )
         ax.scatter(
             arange[radio_usages],
             tumor_volumes[:-1][radio_usages],
             color='blue',
             label=radio_label,
-            marker='x',
+            marker=7,
         )
 
     ax.set_title('Tumor Volume')
     ax.set_xlabel('Time Steps')
     ax.set_ylabel('Volume')
+    ax.set_yscale('log', nonpositive='clip')
     ax.legend()
-    plt.show()
+    return fig, ax

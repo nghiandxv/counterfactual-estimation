@@ -1,67 +1,96 @@
-from collections import namedtuple
+from typing import NamedTuple
+
+import einops as ei
+import jaxtyping as jty
+import lightning as ltn
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as fn
+import torch.optim as optim
 import torch.utils.data as data_utils
-import einops as ei
-import numpy as np
-import jaxtyping as jty
-from skorch import NeuralNet
-from src.utils.tensor import expect_shape
-from src.simulations.non_small_lung_cancer import (
-    DefaultTreatmentPlan,
-    PatientParams,
-    SimulationResult,
-    run_simulation,
-    PatientStatuses,
-)
-from src.utils.misc import Seed, get_device, tqdm
-from typing import TypedDict
 from beartype import beartype
+from loguru import logger
+from torchmetrics.functional import mean_absolute_error, mean_squared_error
 
-from src.modules.gradient_reversal import GradientReversal
+from src.simulations import non_small_lung_cancer as nslc
+from src.utils.misc import tqdm_print, zip_tqdm
+from src.utils.modules.gradient_reversal import GradientReversal
+from src.utils.modules.misc import TakeElement, UnpackInput
+from src.utils.tensor import expect, get_device, to_device, to_tensor
+
+logger.remove()
+logger.add(lambda msg: tqdm_print(msg), colorize=True)
+
+
+@beartype
+def make_treatments_seq(
+    next_treatments_seqs: jty.Int[torch.Tensor, '*b t a'],
+    init_treatments: jty.Int[torch.Tensor, '*b a'] | None = None,
+):
+    *b, _, a = next_treatments_seqs.shape
+    if len(b) > 1:
+        raise ValueError('At most 1 batch dimension is allowed.')
+
+    if init_treatments is None:
+        device = get_device(next_treatments_seqs)
+        init_treatments = torch.zeros((*b, 1, a), device=device, dtype=int)
+    else:
+        init_treatments = ei.rearrange(init_treatments, 'b a -> b 1 a')
+
+    pattern = '* a' if len(b) == 0 else 'b * a'
+    return ei.pack([init_treatments, next_treatments_seqs[:, :-1, :]], pattern)[0]
+
+
+@beartype
+def make_mask(max_time_step: int, end_time_steps: jty.Int[torch.Tensor, 'b']):
+    time_steps = torch.arange(max_time_step, device=get_device(end_time_steps))
+    mask_seqs = time_steps < ei.repeat(end_time_steps, 'b -> b t', t=max_time_step)
+    return mask_seqs
 
 
 class CRNModule(nn.Module):
     @beartype
-    class Output(TypedDict):
-        used_treatment_logits_series: jty.Float[torch.Tensor, 'b t n']
-        estimated_outcomes_series: jty.Float[torch.Tensor, 'b t o']
-        next_representation_series: jty.Float[torch.Tensor, 'b t h']
+    class Output(NamedTuple):
+        treatment_logits_seqs: jty.Float[torch.Tensor, '*b t n']
+        next_outcomes_seqs: jty.Float[torch.Tensor, '*b t o']
+        next_representation_seqs: jty.Float[torch.Tensor, '*b t h']
 
     @beartype
-    class ForcastOutput(TypedDict):
-        outcome: jty.Float[torch.Tensor, 'b o']
-        representation: jty.Float[torch.Tensor, 'b h']
-
     def __init__(
         self,
-        num_covariates: int,
         num_outcomes: int,
-        num_hidden_units: int,
         num_treatments: int,
-        dropout: float = 0.5,
+        num_covariates: int = 0,
+        num_static_covariates: int = 0,
+        num_hidden_units: int = 10,
+        dropout_prob: float = 0.2,
+        num_hidden_layers: int = 3,
         alpha: float = 1.0,
     ):
         super().__init__()
-        self.num_covariates = num_covariates
-        self.num_outcomes = num_outcomes
+        self.num_outcomes, self.num_treatments = num_outcomes, num_treatments
+        self.num_covariates, self.num_static_covariates = num_covariates, num_static_covariates
+
         self.num_hidden_units = num_hidden_units
-        self.num_treatments = num_treatments
+
+        self.num_hidden_layers = num_hidden_layers
+        self.dropout_prob = dropout_prob
         self.alpha = alpha
 
+        num_total_covariates = self.num_covariates + self.num_static_covariates
+
         self.lstm = nn.LSTM(
-            input_size=self.num_covariates + 1,
-            hidden_size=num_hidden_units,
-            dropout=dropout,
-            num_layers=1,
+            input_size=self.num_outcomes + self.num_treatments + num_total_covariates,
+            hidden_size=self.num_hidden_units,
+            dropout=self.dropout_prob,
+            num_layers=self.num_hidden_layers,
             batch_first=True,
             bidirectional=False,
         )
+        self.projector = nn.Linear(num_hidden_units, num_hidden_units)
         self.representor = nn.Sequential(
-            nn.ELU(),
-            nn.Linear(num_hidden_units, num_hidden_units),
-            nn.ELU(),
+            UnpackInput(self.lstm), TakeElement(0), nn.ELU(), self.projector, nn.ELU()
         )
 
         self.treatment_classifier = nn.Sequential(
@@ -71,7 +100,7 @@ class CRNModule(nn.Module):
             nn.Linear(self.num_hidden_units, self.num_treatments),
         )
         self.outcome_regressor = nn.Sequential(
-            nn.Linear(self.num_hidden_units + 1, self.num_hidden_units),
+            nn.Linear(self.num_hidden_units + self.num_treatments, self.num_hidden_units),
             nn.ELU(),
             nn.Linear(self.num_hidden_units, self.num_outcomes),
         )
@@ -83,490 +112,387 @@ class CRNModule(nn.Module):
         if init_representation is None:
             return None
 
-        b, _ = init_representation.shape
+        b, h = init_representation.shape
+        l = self.num_hidden_layers  # noqa: E741
         device = get_device(init_representation)
         return (
-            ei.rearrange(init_representation, 'b h -> 1 b h').to(device),
-            torch.zeros(1, b, self.num_hidden_units).to(device),
+            ei.repeat(init_representation, 'b h -> l b h', l=l).to(device).contiguous(),
+            torch.zeros(self.num_hidden_layers, b, h).to(device),
         )
 
     def forward(
         self,
-        covariates_series: jty.Float[torch.Tensor, 'b t c'],
-        used_treatment_series: jty.Integer[torch.Tensor, 'b t'],
-        next_treatment: jty.Integer[torch.Tensor, 'b'],
-        init_representation: jty.Float[torch.Tensor, 'b h'] | None = None,
+        outcomes_seqs: jty.Float[torch.Tensor, 'b t o'],
+        next_treatments_seqs: jty.Int[torch.Tensor, 'b t a'],
+        # covariates_seqs: jty.Float[torch.Tensor, 'b t c'] | None = None,
+        static_covariates: jty.Float[torch.Tensor, 'b s'] | None = None,
+        init_treatments: jty.Float[torch.Tensor, 'b a'] | None = None,
+        init_representations: jty.Float[torch.Tensor, 'b h'] | None = None,
     ):
-        b, t, _ = covariates_series.shape
-        c, h = self.num_covariates, self.num_hidden_units
+        b, t, _ = outcomes_seqs.shape
 
-        expect_shape(covariates_series, 'b t c', b=b, t=t, c=c)
-        expect_shape(used_treatment_series, 'b t', b=b, t=t)
-        if next_treatment is not None:
-            expect_shape(next_treatment, 'b', b=b)
-        if init_representation is not None:
-            expect_shape(init_representation, 'b h', b=b, h=h)
+        o, a = self.num_outcomes, self.num_treatments
+        s = self.num_static_covariates
+        # c, s = self.num_covariates, self.num_static_covariates
+        h = self.num_hidden_units
 
-        used_treatment_series = used_treatment_series.float()
-        next_treatment = next_treatment.float()
+        expect(outcomes_seqs, 'b t o', b=b, t=t, o=o)
+        expect(next_treatments_seqs, 'b t a', b=b, t=t, a=a)
+        # if covariates_seqs is not None:
+        #     expect(covariates_seqs, 'b t c', b=b, t=t, c=c)
+        if static_covariates is not None:
+            expect(static_covariates, 'b s', b=b, s=s)
+        if init_treatments is not None:
+            expect(init_treatments, 'b a', b=b, a=a)
+        if init_representations is not None:
+            expect(init_representations, 'b h', b=b, h=h)
 
-        lstm_inputs = ei.pack(
-            [covariates_series, used_treatment_series], pattern='b t *'
-        )[0]
+        treatments_seq = make_treatments_seq(next_treatments_seqs, init_treatments)
+        lstm_inputs = ei.pack([outcomes_seqs, treatments_seq], 'b t *')[0]
+        # if covariates_seqs is not None:
+        #     lstm_inputs = ei.pack([lstm_inputs, covariates_seqs], 'b t *')[0]
+        if static_covariates is not None:
+            static_covariate_seq = ei.repeat(static_covariates, 'b s -> b t s', t=t)
+            lstm_inputs = ei.pack([lstm_inputs, static_covariate_seq], 'b t *')[0]
 
-        init_hidden_state = self.make_init_hidden_state(init_representation)
-        next_hidden_state_series, _ = self.lstm(lstm_inputs, init_hidden_state)
-        next_representation_series = self.representor(next_hidden_state_series)
+        init_hidden_states = self.make_init_hidden_state(init_representations)
+        next_representation_seqs = self.representor((lstm_inputs, init_hidden_states))
+        treatment_logits_seqs = self.treatment_classifier(next_representation_seqs)
 
-        used_treatment_logits_series = self.treatment_classifier(
-            next_representation_series
-        )
-
-        next_treatment_series = ei.pack(
-            [used_treatment_series[:, 1:], next_treatment], pattern='b *'
-        )[0]
-
-        regressor_inputs = ei.pack(
-            [next_representation_series, next_treatment_series], pattern='b t *'
-        )[0]
-        next_outcome_series = self.outcome_regressor(regressor_inputs)
+        regressor_inputs = ei.pack([next_representation_seqs, next_treatments_seqs], 'b t *')[0]
+        next_outcome_seqs = self.outcome_regressor(regressor_inputs)
 
         return self.Output(
-            used_treatment_logits_series=used_treatment_logits_series,
-            estimated_outcomes_series=next_outcome_series,
-            next_representation_series=next_representation_series,
+            treatment_logits_seqs=treatment_logits_seqs,
+            next_outcomes_seqs=next_outcome_seqs,
+            next_representation_seqs=next_representation_seqs,
         )
 
-    # @torch.no_grad()
-    # def generate_next(
-    #     self,
-    #     covariates_series: jty.Float[torch.Tensor, 'b t c'],
-    #     used_treatment_series: jty.Float[torch.Tensor, 'b t'],
-    #     next_treatment: jty.Float[torch.Tensor, 'b'],
-    #     init_representation: jty.Float[torch.Tensor, 'b h'],
-    # ):
-    #     output = self(
-    #         covariates_series=covariates_series,
-    #         used_treatment_series=used_treatment_series,
-    #         next_treatment=next_treatment,
-    #         init_representation=init_representation,
-    #     )
-    #     return self.ForcastOutput(
-    #         outcome=ei.rearrange(
-    #             output.estimated_outcome_series[:, -1, :], 'b 1 o -> b -> o'
-    #         ),
-    #         representation=ei.rearrange(
-    #             output.next_representaion_series[:, -1, :], 'b 1 h -> b h'
-    #         ),
-    #     )
+
+class CRNBaseDataset(data_utils.Dataset):
+    @beartype
+    class EncoderBatch(NamedTuple):
+        outcome_seqs: jty.Float[torch.Tensor, '*b t o']
+        next_outcome_seqs: jty.Float[torch.Tensor, '*b t o']
+        next_treatment_seqs: jty.Int[torch.Tensor, '*b t a']
+        static_covariates: jty.Float[torch.Tensor, '*b s']
+        end_time_steps: jty.Int[torch.Tensor, '*b']
+
+        @property
+        def treatment_seqs(self):
+            return make_treatments_seq(self.next_treatment_seqs, None)
+
+    @beartype
+    class DecoderBatch(NamedTuple):
+        outcome_seqs: jty.Float[torch.Tensor, '*b t o']
+        next_outcome_seqs: jty.Float[torch.Tensor, '*b t o']
+        next_treatment_seqs: jty.Int[torch.Tensor, '*b t a']
+        static_covariates: jty.Float[torch.Tensor, '*b s']
+        end_time_steps: jty.Int[torch.Tensor, '*b']
+        init_treatments: jty.Int[torch.Tensor, '*b a']
+        init_representations: jty.Float[torch.Tensor, '*b h']
+
+        @property
+        def treatment_seqs(self):
+            return make_treatments_seq(self.next_treatment_seqs, self.init_treatments)
+
+    Batch = EncoderBatch | DecoderBatch
 
 
-class DefaultTumorSimulationDataset(data_utils.Dataset):
+@beartype
+class SeqStats(NamedTuple):
+    mean: jty.Float[torch.Tensor, '*']
+    std: jty.Float[torch.Tensor, '*']
+
+
+DEFAULT_STATS = SeqStats(mean=torch.tensor(0.0), std=torch.tensor(1.0))
+
+
+class CRNLightningModule(ltn.LightningModule):
     def __init__(
         self,
-        num_patients: int,
-        num_time_steps: int,
-        chemo_gamma: float = 5.0,
-        radio_gamma: float = 5.0,
-        seed: Seed = 0,
+        outcomes_stats: SeqStats = DEFAULT_STATS,
+        static_covariates_stats: SeqStats = DEFAULT_STATS,
+        max_outcome_value: float = 1.0,
+        **crn_kwargs,
     ):
-        self.num_patients = num_patients
-        self.num_time_steps = num_time_steps
-        self.treatment_plan = DefaultTreatmentPlan(
-            chemo_gamma=chemo_gamma, radio_gamma=radio_gamma
-        )
-        self.patient_profiles, self.results = run_simulation(
-            num_patients=num_patients,
-            num_time_steps=num_time_steps,
-            treatment_plan=self.treatment_plan,
-            seed=seed,
-        )
+        super().__init__()
+        self.outcomes_stats = outcomes_stats
+        self.static_covariates_stats = static_covariates_stats
+        self.max_outcome_value = max_outcome_value
+        self.save_hyperparameters(crn_kwargs)
+        self.module = CRNModule(**crn_kwargs)
 
-    def __len__(self):
-        return self.num_patients
-
-    def __getitem__(self, idx):
-        return self.patient_profiles[idx], self.results[idx]
-
-    def plot(self):
-        import matplotlib.pyplot as plt
-
-        _, ax = plt.subplots()
-
-        for idx, (_, result) in enumerate(self):
-            tumor_model, treatment_plan = result.tumor_model, result.treatment_plan
-            tumor_volumes = np.asarray(tumor_model.state.volumes)
-            chemo_usages = np.asarray([False] + list(treatment_plan.state.chemo_usages))
-            radio_usages = np.asarray([False] + list(treatment_plan.state.radio_usages))
-
-            ax.plot(tumor_volumes)
-
-            arange = np.arange(len(tumor_volumes))
-            chemo_label = 'Chemo' if idx == 0 else None
-            radio_label = 'Radio' if idx == 0 else None
-            ax.scatter(
-                arange[chemo_usages],
-                tumor_volumes[chemo_usages],
-                color='red',
-                label=chemo_label,
-                marker='+',
-            )
-            ax.scatter(
-                arange[radio_usages],
-                tumor_volumes[radio_usages],
-                color='blue',
-                label=radio_label,
-                marker='x',
-            )
-
-        ax.set_title('Tumor Volume')
-        ax.set_xlabel('Time Steps')
-        ax.set_ylabel('Volume')
-        ax.legend()
-        plt.show()
-
-
-class BaseCRNDataset(data_utils.Dataset):
-    @beartype
-    class Input(TypedDict):
-        covariates_series: jty.Float[torch.Tensor, 't c']
-        used_treatment_series: jty.Integer[torch.Tensor, 't']
-        next_treatment: jty.Integer[torch.Tensor, '']
-
-    @beartype
-    class Target(TypedDict):
-        used_treatment_series: jty.Integer[torch.Tensor, 't']
-        outcomes_series: jty.Float[torch.Tensor, 't o']
-        mask_series: jty.Bool[torch.Tensor, 't']
-
-    def __init__(self, dataset: DefaultTumorSimulationDataset):
-        self.dataset = dataset
-
-    def __len__(self):
-        return self.dataset.num_patients
-
-
-class CRNLoss(nn.Module):
-    def forward(self, y_pred, y_true):
-        used_treatment_logits_series = y_pred['used_treatment_logits_series']
-        estimated_outcomes_series = y_pred['estimated_outcomes_series']
-
-        treatment_label_series = y_true['used_treatment_series']
-        outcomes_series = y_true['outcomes_series']
-        mask_series = y_true['mask_series']
-
-        flattened_logits = ei.rearrange(
-            used_treatment_logits_series, pattern='b t n -> (b t) n'
-        )
-        flattened_label = ei.rearrange(treatment_label_series, pattern='b t -> (b t)')
-        flattened_is_valid = ei.rearrange(mask_series, pattern='b t -> (b t)')
-        treatment_loss = fn.cross_entropy(
-            flattened_logits[flattened_is_valid],
-            flattened_label[flattened_is_valid],
+    def forward(self, batch: CRNBaseDataset.Batch):
+        return self.module(
+            outcomes_seqs=self.scale(batch.outcome_seqs, self.outcomes_stats),
+            next_treatments_seqs=batch.next_treatment_seqs,
+            static_covariates=self.scale(batch.static_covariates, self.static_covariates_stats),
+            init_treatments=getattr(batch, 'init_treatments', None),
+            init_representations=getattr(batch, 'init_representations', None),
         )
 
-        outcome_loss = fn.mse_loss(
-            estimated_outcomes_series[mask_series], outcomes_series[mask_series]
+    def scale(self, seq, stats: SeqStats):
+        device = get_device(seq)
+        return (seq - to_device(stats.mean, device=device)) / to_device(stats.std, device=device)
+
+    def unscale(self, seq, stats: SeqStats):
+        device = get_device(seq)
+        return seq * to_device(stats.std, device=device) + to_device(stats.mean, device=device)
+
+    def compute_loss(self, output: CRNModule.Output, batch: CRNBaseDataset.Batch, prefix: str):
+        max_time_step = batch.outcome_seqs.shape[1]
+        mask_seqs = make_mask(max_time_step=max_time_step, end_time_steps=batch.end_time_steps)
+
+        next_outcome_seqs = output.next_outcomes_seqs[mask_seqs]
+        target_next_outcome_seqs = self.scale(
+            batch.next_outcome_seqs[mask_seqs], self.outcomes_stats
         )
-        return outcome_loss, treatment_loss
 
+        treatment_logits_seqs = output.treatment_logits_seqs[mask_seqs]
+        target_treatment_seqs = batch.treatment_seqs[mask_seqs]
 
-class CRNTrainer(NeuralNet):
-    def get_loss(self, y_pred, y_true, X=None, training=False):
-        outcome_loss, treatment_loss = super().get_loss(y_pred, y_true, X, training)
-
-        num_train_batches = sum(
-            len(epoch_history['batches']) for epoch_history in self.history
+        outcome_loss = fn.mse_loss(next_outcome_seqs, target_next_outcome_seqs)
+        treatment_loss = fn.binary_cross_entropy_with_logits(
+            treatment_logits_seqs, target_treatment_seqs.float()
         )
 
-        epoch_ratio = torch.tensor(len(self.history) / self.max_epochs).float()
-
+        epoch_ratio = torch.tensor(self.current_epoch / self.trainer.max_epochs).float()
         lambda_ = 2 / (1 + torch.exp(-10 * epoch_ratio)) - 1
+
         loss = outcome_loss - lambda_ * treatment_loss
 
-        prefix = 'train' if training else 'valid'
+        with torch.no_grad():
+            unscaled_next_outcome_seqs = self.unscale(next_outcome_seqs, self.outcomes_stats)
+            unscaled_target_next_outcome_seqs = self.unscale(
+                target_next_outcome_seqs, self.outcomes_stats
+            )
+            rmse = mean_squared_error(
+                unscaled_next_outcome_seqs, unscaled_target_next_outcome_seqs, squared=False
+            )
+            nrmse = rmse / self.max_outcome_value * 100
 
-        self.history.record_batch(prefix + '_treatment_loss', treatment_loss.item())
-        self.history.record_batch(prefix + '_outcome_loss', outcome_loss.item())
-        if training:
-            self.history.record_batch(prefix + '_lambda', lambda_.item())
-        self.history.record_batch(prefix + '_steps', num_train_batches)
+            mae = mean_absolute_error(unscaled_next_outcome_seqs, unscaled_target_next_outcome_seqs)
+            nmae = mae / self.max_outcome_value * 100
+
+        self.log(f'{prefix}/loss', loss)
+        self.log(f'{prefix}/loss/outcome', outcome_loss)
+        self.log(f'{prefix}/loss/treatment', treatment_loss)
+        self.log(f'{prefix}/metric/nrmse', nrmse)
+        self.log(f'{prefix}/metric/nmae', nmae)
+        self.log(f'{prefix}/other/lambda', lambda_)
 
         return loss
 
+    def training_step(self, batch: CRNBaseDataset.Batch, batch_idx: int):
+        output = self(batch)
+        return self.compute_loss(output, batch, prefix='train')
 
-def process_crn_simulation_result(
-    result: SimulationResult, patient_params: PatientParams
-):
-    tumor_model, treatment_plan = result.tumor_model, result.treatment_plan
+    def validation_step(self, batch: CRNBaseDataset.Batch, batch_idx: int):
+        output = self(batch)
+        return self.compute_loss(output, batch, prefix='val')
 
-    volume_series = np.asarray(tumor_model.state.volumes)
-    patient_group_series = np.full_like(volume_series, patient_params.group)
-    patient_status_series = np.asarray(tumor_model.state.patient_statuses)
+    def test_step(self, batch: CRNBaseDataset.Batch, batch_idx: int):
+        output = self(batch)
+        return self.compute_loss(output, batch, prefix='test')
 
-    next_chemo_usage_series = np.asarray(treatment_plan.state.chemo_usages)
-    next_radio_usage_series = np.asarray(treatment_plan.state.radio_usages)
+    def regress_outcome(self, batch: CRNBaseDataset.Batch):
+        output = self(batch)
+        return self.unscale(output.next_outcomes_seqs, self.outcomes_stats)
 
-    usage_series = ei.pack(
-        [
-            ei.pack([np.array(0), next_chemo_usage_series], '*')[0],
-            ei.pack([np.array(0), next_radio_usage_series], '*')[0],
-        ],
-        pattern='num_time_steps *',
-    )[0]
+    def configure_optimizers(self):
+        return optim.Adam(self.module.parameters(), lr=1e-4)
 
-    treatment_series = np.select(
-        condlist=[
-            ei.reduce(usage_series == [0, 0], 't d -> t', np.all),
-            ei.reduce(usage_series == [1, 0], 't d -> t', np.all),
-            ei.reduce(usage_series == [0, 1], 't d -> t', np.all),
-            ei.reduce(usage_series == [1, 1], 't d -> t', np.all),
-        ],
-        choicelist=[0, 1, 2, 3],
-        default=np.nan,
-    )
-
-    assert np.all(~np.isnan(treatment_series))
-    assert len(volume_series) == len(patient_status_series)
-
-    mask_series = patient_status_series == PatientStatuses.TUMOR
-    masked_volume_series = np.where(mask_series, volume_series, 0)
-    masked_patient_group_series = np.where(mask_series, patient_group_series, 0)
-    masked_treatment_series = np.where(mask_series, treatment_series, 0)
-
-    return (
-        masked_volume_series,
-        masked_patient_group_series,
-        masked_treatment_series,
-        mask_series,
-    )
-
-
-def process_crn_inputs_and_labels(
-    full_volume_series: list[jty.Float[np.ndarray, 't']],
-    full_patient_group_series: list[jty.Float[np.ndarray, 't']],
-    full_treatment_series: list[jty.Float[np.ndarray, 't']],
-    full_mask_series: list[jty.Bool[np.ndarray, 't']],
-):
-    all_patient_group_series = ei.pack(full_patient_group_series, '* x')[0]
-    all_volume_series = ei.pack(full_volume_series, '* x')[0]
-    all_treatment_series = ei.pack(full_treatment_series, '* x')[0]
-    all_mask_series = ei.pack(full_mask_series, '* x')[0]
-
-    all_covariates_series = ei.pack(
-        [all_volume_series[:, :-1], all_patient_group_series[:, :-1]], 'b t *'
-    )[0].astype(np.float32)
-
-    all_outcomes_series = ei.rearrange(
-        all_volume_series[:, 1:], pattern='b t -> b t 1'
-    ).astype(np.float32)
-
-    all_used_treatment_series = all_treatment_series[:, :-1].astype(np.int64)
-    all_next_treatment = all_treatment_series[:, -1].astype(np.int64)
-    all_mask_series = all_mask_series[:, :-1]
-
-    return (
-        all_covariates_series,
-        all_outcomes_series,
-        all_used_treatment_series,
-        all_next_treatment,
-        all_mask_series,
-    )
-
-
-# class CRNEncoderDataset(BaseCRNDataset):
-class CRNEncoderDataset(data_utils.Dataset):
-    @beartype
-    class Input(TypedDict):
-        covariates_series: jty.Float[torch.Tensor, 't c']
-        used_treatment_series: jty.Integer[torch.Tensor, 't']
-        next_treatment: jty.Integer[torch.Tensor, '']
-
-    @beartype
-    class Target(TypedDict):
-        used_treatment_series: jty.Integer[torch.Tensor, 't']
-        outcomes_series: jty.Float[torch.Tensor, 't o']
-        mask_series: jty.Bool[torch.Tensor, 't']
-
-    SeriesStats = namedtuple('SeriesStats', ['mean', 'std'])
-
-    def __init__(
-        self, patient_profiles: list[PatientParams], results: list[SimulationResult]
-    ):
-        self.patient_profiles = patient_profiles
-        self.results = results
-
-        full_patient_group_series = []
-        full_volume_series = []
-        full_treatment_series = []
-        full_mask_series = []
-
-        for patient_params, result in tqdm(
-            zip(patient_profiles, results),
-            desc='Processing',
-            total=len(patient_profiles),
-        ):
-            (
-                masked_volume_series,
-                masked_patient_group_series,
-                masked_treatment_series,
-                mask_series,
-            ) = process_crn_simulation_result(result, patient_params)
-
-            full_patient_group_series.append(masked_patient_group_series)
-            full_volume_series.append(masked_volume_series)
-            full_treatment_series.append(masked_treatment_series)
-            full_mask_series.append(mask_series)
-
-        (
-            self.all_covariates_series,
-            self.all_outcomes_series,
-            self.all_used_treatment_series,
-            self.all_next_treatment,
-            self.all_mask_series,
-        ) = process_crn_inputs_and_labels(
-            full_volume_series,
-            full_patient_group_series,
-            full_treatment_series,
-            full_mask_series,
+    def make_metrics_string(self, metrics: dict[str, torch.Tensor]):
+        return ' | '.join(
+            f'{key}={value:6.2f}' for key, value in metrics.items() if 'other' not in key
         )
 
-        def calc_stats(all_series):
-            masked_series = np.ma.array(
-                all_series,
-                mask=~ei.repeat(
-                    self.all_mask_series, 'b t -> b t x', x=all_series.shape[-1]
-                ),
+    def on_validation_epoch_end(self):
+        metrics_str = self.make_metrics_string(self.trainer.callback_metrics)
+        epoch_str = str(self.current_epoch).zfill(len(str(self.trainer.max_epochs)))
+        logger.info(f'E{epoch_str} - {metrics_str}')
+
+
+def extract_result(result: nslc.SimulationResult, patient_params: nslc.PatientParams):
+    tumor_model, treatment_plan = result.tumor_model, result.treatment_plan
+
+    patient_type = patient_params.patient_type
+    volume_seq = np.asarray(tumor_model.state.volumes)
+    patient_status_seq = np.asarray(tumor_model.state.patient_statuses)
+
+    next_chemo_usage_seq = np.asarray(treatment_plan.state.chemo_usages)
+    next_radio_usage_seq = np.asarray(treatment_plan.state.radio_usages)
+
+    next_usages_seq = ei.pack(
+        [
+            ei.pack([np.array(0), next_chemo_usage_seq], '*')[0],
+            ei.pack([np.array(0), next_radio_usage_seq], '*')[0],
+        ],
+        pattern='t *',
+    )[0]
+
+    end_time_steps = np.flatnonzero(patient_status_seq != nslc.PatientStatuses.TUMOR)
+    end_time_step = end_time_steps[0] if len(end_time_steps) != 0 else len(volume_seq)
+
+    return volume_seq, next_usages_seq, patient_type, end_time_step
+
+
+def process_data(
+    volume_seqs: list[jty.Float[np.ndarray, 't']],
+    usages_seqs: list[jty.Float[np.ndarray, 't a']],
+    patient_types: list[nslc.PatientTypes],
+    end_time_steps: list[int],
+):
+    outcomes_seqs = ei.rearrange(ei.pack(volume_seqs, '* t')[0], 'b t -> b t 1')
+    treatments_seqs = ei.pack(usages_seqs, '* t a')[0]
+    static_covariates_grp = ei.rearrange(np.asarray(patient_types), 'b -> b 1')
+
+    return to_tensor(
+        outcomes_seqs.astype(np.float32),
+        treatments_seqs.astype(np.int64),
+        static_covariates_grp.astype(np.float32),
+        np.asarray(end_time_steps).astype(np.int64),
+    )
+
+
+def calc_all_stats(
+    outcomes_seqs: jty.Float[torch.Tensor, '*b t o'],
+    static_covariates_grp: jty.Float[torch.Tensor, '*b s'],
+    end_time_steps: jty.Int[torch.Tensor, '*b'],
+):
+    def calc_stats(data):
+        return SeqStats(
+            mean=to_tensor(ei.reduce(ei.asnumpy(data), '... x -> x', reduction=np.nanmean)),
+            std=to_tensor(ei.reduce(ei.asnumpy(data), '... x -> x', reduction=np.nanstd)),
+        )
+
+    mask_seqs = make_mask(outcomes_seqs.shape[1], end_time_steps=end_time_steps)
+    masked_outcomes_seqs = torch.where(
+        ei.rearrange(mask_seqs, 'b t -> b t 1'), outcomes_seqs, torch.nan
+    )
+    outcomes_stats = calc_stats(masked_outcomes_seqs)
+    static_covariate_stats = calc_stats(static_covariates_grp)
+
+    return outcomes_stats, static_covariate_stats
+
+
+class CRNEncoderDataset(CRNBaseDataset):
+    def __init__(
+        self, patient_profiles: list[nslc.PatientParams], results: list[nslc.SimulationResult]
+    ):
+        self.patient_profiles, self.results = patient_profiles, results
+
+        volume_seqs, next_usages_seqs, patient_types, end_time_steps = [], [], [], []
+        for patient_params, result in zip_tqdm(patient_profiles, results, desc='Processing'):
+            volume_seq, next_usages_seq, patient_type, end_time_step = extract_result(
+                result, patient_params
             )
-            return self.SeriesStats(
-                mean=ei.reduce(masked_series, 'b t x -> x', np.ma.mean).astype(
-                    np.float32
-                ),
-                std=ei.reduce(masked_series, 'b t x -> x', np.ma.std).astype(
-                    np.float32
-                ),
-            )
 
-        self.covariates_stats = calc_stats(self.all_covariates_series)
-        self.outcomes_stats = calc_stats(self.all_outcomes_series)
+            volume_seqs.append(volume_seq)
+            next_usages_seqs.append(next_usages_seq)
+            patient_types.append(patient_type)
+            end_time_steps.append(end_time_step)
 
-    def scale(self, series, stats):
-        return (series - stats.mean) / stats.std
+        (
+            self.outcomes_seqs,
+            self.next_treatments_seqs,
+            self.static_covariates_grp,
+            self.end_time_steps,
+        ) = process_data(volume_seqs, next_usages_seqs, patient_types, end_time_steps)
 
-    def unscale(self, series, stats):
-        return series * stats.std + stats.mean
+    @property
+    def num_outcomes(self):
+        return self.outcomes_seqs.shape[2]
+
+    @property
+    def num_treatments(self):
+        return self.next_treatments_seqs.shape[2]
+
+    @property
+    def num_static_covariates(self):
+        return self.static_covariates_grp.shape[1]
 
     def __getitem__(self, idx: int):
-        return self.Input(
-            covariates_series=self.scale(
-                self.all_covariates_series[idx], self.covariates_stats
-            ),
-            used_treatment_series=self.all_used_treatment_series[idx],
-            next_treatment=self.all_next_treatment[idx],
-        ), self.Target(
-            used_treatment_series=self.all_used_treatment_series[idx],
-            outcomes_series=self.scale(
-                self.all_outcomes_series[idx], self.outcomes_stats
-            ),
-            mask_series=self.all_mask_series[idx],
+        return self.EncoderBatch(
+            outcome_seqs=self.outcomes_seqs[idx][:-1],
+            next_outcome_seqs=self.outcomes_seqs[idx][1:],
+            next_treatment_seqs=self.next_treatments_seqs[idx][:-1],
+            static_covariates=self.static_covariates_grp[idx],
+            end_time_steps=self.end_time_steps[idx],
         )
 
     def __len__(self):
-        return len(self.all_covariates_series)
+        return len(self.outcomes_seqs)
 
 
 class CRNDecoderDataset(CRNEncoderDataset):
-    @beartype
-    class Input(CRNEncoderDataset.Input):
-        init_representation: jty.Float[torch.Tensor, 'b h']
-
     def __init__(
         self,
-        dataset: DefaultTumorSimulationDataset,
+        patient_profiles: list[nslc.PatientParams],
+        results: list[nslc.SimulationResult],
         max_time_steps: int,
         encoder: CRNModule,
     ):
-        super().__init__(dataset)
+        super().__init__(patient_profiles, results)
 
         self.max_time_steps = max_time_steps
-        self.encoder = encoder
 
-        full_covariates_series, full_outcomes_series = [], []
-        full_used_treatment_series, full_next_treatment = [], []
-        full_init_representation = []
-        full_mask_series = []
+        outcomes_seqs, next_treatments_seqs, static_covariates_grp = [], [], []
+        init_treatments_grp, init_representation_grp = [], []
 
-        device = get_device(self.encoder)
+        device = get_device(encoder)
+        encoder.eval()
 
-        def as_input(input):
-            return ei.rearrange(torch.as_tensor(input), '... -> 1 ...').to(device)
+        def as_input(data):
+            return to_device(ei.rearrange(data, '... -> 1 ...'), device=device)
 
-        for (
-            covariates_series,
-            outcomes_series,
-            used_treatment_series,
-            next_treatment,
-            mask_series,
-        ) in tqdm(
-            zip(
-                self.all_covariates_series,
-                self.all_outcomes_series,
-                self.all_used_treatment_series,
-                self.all_next_treatment,
-                self.all_mask_series,
-            ),
+        for outcomes_seq, next_treatments_seq, static_covariates, end_time_step in zip_tqdm(
+            self.outcomes_seqs,
+            self.next_treatments_seqs,
+            self.static_covariates_grp,
+            self.end_time_steps,
             desc='Processing',
-            total=len(self.all_covariates_series),
         ):
-            num_actual_time_steps = np.sum(mask_series)
-            covariates_series = covariates_series[:num_actual_time_steps]
-            outcomes_series = outcomes_series[:num_actual_time_steps]
-            used_treatment_series = used_treatment_series[:num_actual_time_steps]
-            mask_series = mask_series[:num_actual_time_steps]
+            outcomes_seq = outcomes_seq[:end_time_step]
+            next_treatments_seq = next_treatments_seq[:end_time_step]
 
-            considered_time_steps = num_actual_time_steps - self.max_time_steps
-            for t in range(considered_time_steps):
+            for t in range(end_time_step - self.max_time_steps):
                 end_t = t + self.max_time_steps
 
-                full_covariates_series.append(covariates_series[t:end_t])
-                full_outcomes_series.append(outcomes_series[t:end_t])
-                full_used_treatment_series.append(used_treatment_series[t:end_t])
-                if t == considered_time_steps - 1:
-                    full_next_treatment.append(next_treatment)
+                outcomes_seqs.append(outcomes_seq[t:end_t])
+                next_treatments_seqs.append(next_treatments_seq[t:end_t])
+                static_covariates_grp.append(static_covariates)
+
+                if t == 0:
+                    num_treatments = next_treatments_seq.shape[1]
+                    init_treatments_grp.append(torch.zeros(num_treatments).long())
                 else:
-                    full_next_treatment.append(used_treatment_series[end_t])
-                full_mask_series.append(mask_series[t:end_t])
+                    init_treatments_grp.append(next_treatments_seq[t - 1])
 
-                self.encoder.eval()
+            init_representation_grp.append(torch.zeros(encoder.num_hidden_units).float())
+            if end_time_step > 1:
                 with torch.no_grad():
-                    output = self.encoder(
-                        covariates_series=as_input(full_covariates_series[-1]),
-                        used_treatment_series=as_input(full_used_treatment_series[-1]),
-                        next_treatment=as_input(full_next_treatment[-1]),
+                    output = encoder(
+                        outcomes_seqs=as_input(outcomes_seq[: end_time_step - 1]),
+                        next_treatments_seqs=as_input(next_treatments_seq[: end_time_step - 1]),
+                        static_covariates=as_input(static_covariates),
                     )
-                    full_init_representation.append(
-                        output['next_representation_series'][:, -1, :]
-                    )
+                init_representation_grp.extend(output.next_representation_seqs[0].cpu())
 
-        self.all_covariates_series = ei.pack(full_covariates_series, '* t c')[0]
-        self.all_outcomes_series = ei.pack(full_outcomes_series, '* t o')[0]
-        self.all_used_treatment_series = ei.pack(full_used_treatment_series, '* t')[0]
-        self.all_next_treatment = np.asarray(full_next_treatment)
-        self.all_init_representation = ei.pack(full_init_representation, '* h')[0]
-        self.all_mask_series = ei.pack(full_mask_series, '* t')[0]
+        self.outcomes_seqs = ei.pack(outcomes_seqs, '* t o')[0]
+        self.next_treatments_seqs = ei.pack(next_treatments_seqs, '* t a')[0]
+        self.static_covariates_grp = ei.pack(static_covariates_grp, '* s')[0]
+        self.init_treatments_grp = ei.pack(init_treatments_grp, '* a')[0]
+        self.init_representation_grp = ei.pack(init_representation_grp, '* h')[0]
 
     def __getitem__(self, idx: int):
-        return self.Input(
-            covariates_series=self.scale(
-                self.all_covariates_series[idx], self.covariates_stats
-            ),
-            used_treatment_series=self.all_used_treatment_series[idx],
-            next_treatment=self.all_next_treatment[idx],
-            init_representation=self.all_init_representation[idx],
-        ), self.Target(
-            used_treatment_series=self.all_used_treatment_series[idx],
-            outcomes_series=self.scale(
-                self.all_outcomes_series[idx], self.outcomes_stats
-            ),
-            mask_series=self.all_mask_series[idx],
+        return self.DecoderBatch(
+            outcome_seqs=self.outcomes_seqs[idx],
+            next_outcome_seqs=self.outcomes_seqs[idx],
+            next_treatment_seqs=self.next_treatments_seqs[idx],
+            static_covariates=self.static_covariates_grp[idx],
+            end_time_steps=torch.tensor(self.max_time_steps),
+            init_treatments=self.init_treatments_grp[idx],
+            init_representations=self.init_representation_grp[idx],
         )
